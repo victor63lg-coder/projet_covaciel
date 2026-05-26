@@ -1,0 +1,185 @@
+#include <ESP32Servo.h>
+#include <ArduinoJson.h>
+
+// Objets servo :
+// - esc = contrôleur moteur (ESC)
+// - servo = direction
+Servo esc;
+Servo servo;
+
+// ÉTAT ACTUEL
+// Valeurs actuelles envoyées (en microsecondes)
+int currentServoUS = 1450;
+int targetServoUS = 1450;
+int currentSpeedUS = 1500;
+int targetSpeedUS = 1500;
+
+// LIMITES SERVO
+// Bornes physiques de la direction
+const int SERVO_MIN = 1150;
+const int SERVO_MAX = 1650;
+const int SERVO_NEUTRE = 1400;
+
+// LIMITES ESC
+// Bornes physiques de la vitesse
+const int ESC_MIN = 1200;
+const int ESC_MAX = 1700;
+const int ESC_NEUTRE = 1500;
+
+// LISSEMENT
+// Permet d’éviter les mouvements brusques
+const int SMOOTH_STEP = 10;     // Incrément à chaque update
+const int SMOOTH_DELAY = 60;   // Temps entre chaque update (ms)
+unsigned long lastSmoothTime = 0;
+
+// COOLDOWN
+// Évite de traiter trop de commandes trop rapidement
+unsigned long lastCmdTime = 0;
+const unsigned long CMD_INTERVAL = 40;  // délai minimum entre commandes
+
+// FILTRE ANGLE
+// Ignore les petites variations inutiles
+int lastAngle = 9999;
+const int ANGLE_THRESHOLD = 3;
+
+// WATCHDOG COMMUNICATION
+// Sécurité si perte de communication
+unsigned long lastCommTime = 0;
+const unsigned long COMM_TIMEOUT = 3000;  // 3 secondes
+
+void setup() {
+  Serial.begin(115200);
+
+  // Attache les pins aux servos
+  servo.attach(13);
+  esc.attach(14);
+
+  // Initialisation ESC (neutre)
+  esc.writeMicroseconds(ESC_NEUTRE);
+  delay(3000);  // temps nécessaire pour armer l’ESC
+
+  // Centre la direction
+  servo.writeMicroseconds(SERVO_NEUTRE);
+
+  Serial.println("ESP32 READY (MODE F/R)");
+}
+
+void updateSmooth() {
+  unsigned long now = millis();
+
+  // Respect du timing de lissage
+  if (now - lastSmoothTime < SMOOTH_DELAY) return; //si le temps écoulé est inférieur à celui minimum alors on arrète la fonction
+  lastSmoothTime = now;
+
+  // LISSAGE DIRECTION
+  // Approche progressivement la cible
+  if (currentServoUS < targetServoUS) currentServoUS += SMOOTH_STEP;  // on incrémente l'angle des roues vers la droite
+  else if (currentServoUS > targetServoUS) currentServoUS -= SMOOTH_STEP; // on incrémente l'angle des roues vers la gauche
+
+  // Sécurise dans les bornes
+  currentServoUS = constrain(currentServoUS, SERVO_MIN, SERVO_MAX); //on limite les valeurs possibles des angles microsecondes entre deux valeur 1150 et 1650
+
+  // Envoie au servo
+  servo.writeMicroseconds(currentServoUS);
+
+  // LISSAGE VITESSE
+  if (currentSpeedUS < targetSpeedUS) currentSpeedUS += SMOOTH_STEP; //on incrémente la vitesse 
+  else if (currentSpeedUS > targetSpeedUS) currentSpeedUS -= SMOOTH_STEP;// on décrémente la vitesse
+
+  currentSpeedUS = constrain(currentSpeedUS, ESC_MIN, ESC_MAX);
+
+  esc.writeMicroseconds(currentSpeedUS);
+}
+
+//  FAILSAFE
+// Met le système en sécurité si plus de communication
+void checkCommTimeout() {
+  unsigned long now = millis();
+ static bool alreadyWarned = false;
+  if (now - lastCommTime > COMM_TIMEOUT) { //si le temps écoulé entre la dernière réception de données est trop grand alors on arrête le véhicule
+    // Communication perdue → retour au neutre
+    targetSpeedUS = ESC_NEUTRE;
+    targetServoUS = SERVO_NEUTRE;
+
+    // Message affiché une seule fois
+    if (!alreadyWarned) {
+      Serial.println("Timeout communication -> activation mode neutre");
+      alreadyWarned = true;
+    }
+  } else {
+    // Reset du flag si communication OK
+    alreadyWarned = false;
+  }
+}
+
+void loop() {
+  updateSmooth();        // Applique le lissage
+  checkCommTimeout();    // Vérifie la communication
+
+  // Rien à lire → on sort
+  if (!Serial.available()) return;
+
+  // Lecture d’une ligne JSON
+  String jsonStr = Serial.readStringUntil('\n'); //lit les caractères reçus jusqu'au retour à la ligne et stocke le résultat dans une String 
+  jsonStr.trim(); //supprime les espaces et caractères invisibles (comme \r) au début et à la fin de la chaîne 
+  if (jsonStr.length() == 0) return; //si on détecte que la ligne est vide alors on fini la boucle et rien ne passe
+
+  // Mise à jour du watchdog (communication OK)
+  lastCommTime = millis(); //actualise le temps écoulé depuis la dernière communication car on recçoit un json
+
+  // COOLDOWN
+  unsigned long now = millis(); //on récupère le temps actuel
+  if (now - lastCmdTime < CMD_INTERVAL) return; //si le temps écoulé est inférieur au temps précisé avant de recevoir de nouvelles infos alors rien ne se passe
+  lastCmdTime = now; //actualise le temps écoulé depuis la dernière réception de données
+
+  // PARSING JSON 
+  StaticJsonDocument<256> doc; //réserve 256 octets en mémoire statique pour stocker les données JSON après parsing 
+  if (deserializeJson(doc, jsonStr)) { // transforme le jsonStr en doc JSON et retourne une erreur si le format est invalide
+    Serial.println("JSON ERROR");
+    return;
+  }
+
+  // Récupération de l'action
+  String action = doc["action"].as<String>(); //as<String> force la conversion explicite en type String Arduino 
+
+  // COMMANDE DRIVE
+  if (action == "drive") {
+    int angle = doc["angle"]; //on récupère l'angle qui est détecté automatiquement en Int
+    int speed = doc["speed"]; //one récupère la vitesse qui est détecté automatiquement en Int
+
+    // Mise à jour vitesse cible
+    targetSpeedUS = speed; 
+
+    // Normalisation angle [-180 ; 180]
+    int a = angle % 360;
+    if (a > 180) a -= 360; //l'angle devient négatif s'il dépasse 180°
+
+    // Filtrage des petites variations
+    if (abs(a - lastAngle) >= ANGLE_THRESHOLD) {  //on change l'angle visée seulement si la différence d'angles est assez grande
+      lastAngle = a;
+
+      // Limitation sécurité
+      int limited = constrain(a, -90, 90); //on limite l'angle entre -90 et 90°
+
+      // Conversion angle → microsecondes servo
+      targetServoUS = map(limited, -90, 90, SERVO_MIN, SERVO_MAX); 
+    }
+
+    // Debug
+    Serial.print("CMD angle=");
+    Serial.print(angle);
+    Serial.print(" servoUS=");
+    Serial.print(targetServoUS);
+    Serial.print(" speed=");
+    Serial.print(speed);
+    Serial.print(" currentSpeed=");
+    Serial.println(currentSpeedUS);
+  }
+
+  // --- COMMANDE STOP ---
+  else if (action == "stop") {
+    targetSpeedUS = ESC_NEUTRE;  // retour neutre moteur
+    Serial.println("STOP CMD");
+    delay(1000);  // petite pause
+  }
+}
